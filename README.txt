@@ -1,3 +1,6 @@
+FORK of https://bitbucket.org/hpk42/pytest-xdist
+================================================
+
 xdist: pytest distributed testing plugin
 ===============================================================
 
