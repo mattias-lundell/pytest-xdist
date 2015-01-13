@@ -3,6 +3,7 @@ from _pytest.runner import CollectReport
 
 import pytest
 import py
+import itertools
 from xdist.slavemanage import NodeManager
 
 
@@ -405,6 +406,118 @@ class LoadScheduling:
         return same_collection
 
 
+class ClassScheduling(LoadScheduling):
+    """Implement load scheduling accross nodes - class based
+
+    This distributes the tests collected across all nodes so each test
+    is run just once. All nodes collect and submit the test suit and
+    when all collections are received it is verified they are
+    identical collections. Then the collection gets devided up in
+    chunks and chunks get submitted to nodes. Each chunk contains the
+    tests in one class. Whenver a node finishes
+    an item they call ``.remove_item()`` which will trigger the
+    scheduler to assign more tests.
+
+    When created ``numnodes`` defines how many nodes are expected to
+    submit a collection, this is used to know when all nodes have
+    finished collection or how large the chunks need to be created.
+
+    Attributes:
+
+    :numnodes: The expected number of nodes taking part.  The actual
+       number of nodes will vary during the scheduler's lifetime as
+       nodes are added by the DSession as they are brought up and
+       removed either because of a died node or normal shutdown.  This
+       number is primarily used to know when the initial collection is
+       completed.
+
+    :node2collection: Map of nodes and their test collection.  All
+       collections should always be identical.
+
+    :node2pending: Map of nodes and the indices of their pending
+       tests.  The indices are an index into ``.pending`` (which is
+       identical to their own collection stored in
+       ``.node2collection``).
+
+    :collection: The one collection once it is validated to be
+       identical between all the nodes.  It is initialised to None
+       until ``.init_distribute()`` is called.
+
+    :pending: List of indices of globally pending tests.  These are
+       tests which have not yet been allocated to a chunk for a node
+       to process.
+
+    :log: A py.log.Producer instance.
+
+    :config: Config object, used for handling hooks.
+    """
+
+    def init_distribute(self):
+        """Initiate distribution of the test collection
+
+        Initiate scheduling of the items across the nodes. If this
+        gets called again later it behaves the same as calling
+        ``.check_schedule()`` on all nodes so that newly added nodes
+        will start to be used.
+
+        This is called by the ``DSession.slave_collectionfinish`` hook
+        if ``.collection_is_completed`` is True.
+
+        XXX Perhaps this method should have been called ".schedule()".
+        """
+        assert self.collection_is_completed
+
+        # Initial distribution already happend, reschedule on all nodes
+        if self.collection is not None:
+            for node in self.nodes:
+                self.check_schedule(node)
+            return
+
+        # XXX allow nodes to have different collections
+        if not self._check_nodes_have_same_collection():
+            self.log('**Different tests collected, aborting run**')
+            return
+
+        # Collections are identical, create the index of pending items.
+        self.collection = list(self.node2collection.values())[0]
+
+        test_id_map = dict(itertools.izip(self.collection,
+                                          range(len(self.collection))))
+
+        # sort by class name, better way?
+        sortf = lambda test: test.split("::")[1]
+        tests = sorted(self.collection, key=sortf)
+        grouped_tests = [list(xs) for _, xs in itertools.groupby(tests, sortf)]
+        grouped_ids = [[test_id_map[name] for name in names]
+                       for names
+                       in grouped_tests]
+
+        # from the beginning the test are sorted in order
+        sortf = lambda test_ids: min(test_ids)
+        sorted_grouped_ids = sorted(grouped_ids, key=sortf)
+
+        self.pending[:] = sorted_grouped_ids
+
+        if not self.collection:
+            return
+
+        for node in self.nodes:
+            self._send_tests(node)
+
+    def check_schedule(self, node, duration=0):
+        """Maybe schedule new items on the node"""
+        if self.pending:
+            self._send_tests(node)
+
+    def _send_tests(self, node):
+        try:
+            tests_per_node = self.pending.pop()
+            self.node2pending[node].extend(tests_per_node)
+            node.send_runtest_some(tests_per_node)
+        except IndexError:
+            pass
+
+
 def report_collection_diff(from_collection, to_collection, from_id, to_id):
     """Report the collected test difference between two nodes.
 
@@ -502,11 +615,15 @@ class DSession:
     def pytest_runtestloop(self):
         numnodes = len(self.nodemanager.specs)
         dist = self.config.getvalue("dist")
+
         if dist == "load":
             self.sched = LoadScheduling(numnodes, log=self.log,
                                         config=self.config)
         elif dist == "each":
             self.sched = EachScheduling(numnodes, log=self.log)
+        elif dist == "class":
+            self.sched = ClassScheduling(numnodes, log=self.log,
+                                         config=self.config)
         else:
             assert 0, dist
         self.shouldstop = False
@@ -747,4 +864,3 @@ class TerminalDistReporter:
     #def pytest_xdist_rsyncfinish(self, source, gateways):
     #    targets = ", ".join(["[%s]" % gw.id for gw in gateways])
     #    self.write_line("rsyncfinish: %s -> %s" %(source, targets))
-
